@@ -4,3 +4,4 @@ tensorboard
 torchvision
 opencv-python
 matplotlib
+setproctitle
