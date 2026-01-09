@@ -1,4 +1,3 @@
-
 from __future__ import division
 from setproctitle import setproctitle as ptitle
 
@@ -15,7 +14,24 @@ from player_util import Agent
 from environment import create_env
 
 
-def test(args, shared_model, optimizer, train_modes, n_iters):
+def save_checkpoint(args, model, optimizer, episode, n_iter, checkpoint_dir):
+    """Lưu checkpoint trong quá trình test"""
+    if not os.path.exists(checkpoint_dir):
+        os.makedirs(checkpoint_dir)
+    
+    checkpoint_path = os.path.join(checkpoint_dir, 'checkpoint.pth')
+    checkpoint = {
+        'episode': episode,
+        'n_iter': n_iter,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict() if optimizer else None,
+    }
+    torch.save(checkpoint, checkpoint_path)
+    print(f"[Test] Checkpoint saved at episode {episode}, iteration {n_iter}")
+
+
+def test(args, shared_model, optimizer, train_modes, n_iters, episode_counter=None, 
+         checkpoint_dir=None, save_interval=100):
     ptitle('Test Agent')
     n_iter = 0
     writer = SummaryWriter(os.path.join(args.log_dir, 'Test'))
@@ -47,14 +63,19 @@ def test(args, shared_model, optimizer, train_modes, n_iters):
     player.model.eval()
     max_score = -100
     max_avg_score = -100
-    episode = 0
-    avg_reward_eps=0
-    result=[]
+    
+    # Load episode counter từ checkpoint nếu có
+    episode = episode_counter.value if episode_counter else 0
+    
+    avg_reward_eps = 0
+    result = []
+    
     while True:
         AG = 0
         reward_sum = np.zeros(player.num_agents)
         reward_sum_list = []
         len_sum = 0
+        
         for i_episode in range(args.test_eps):
             player.model.load_state_dict(shared_model.state_dict())
             player.reset()
@@ -65,11 +86,13 @@ def test(args, shared_model, optimizer, train_modes, n_iters):
             t0 = time.time()
             count_eps += 1
             fps_all = []
+            
             while True:
                 player.action_test()
                 fps_counter += 1
                 reward_sum_ep += player.reward
                 rotation_sum_ep += player.rotation
+                
                 if player.done:
                     AG += reward_sum_ep[0]/rotation_sum_ep*player.num_agents
                     reward_sum += reward_sum_ep
@@ -88,14 +111,19 @@ def test(args, shared_model, optimizer, train_modes, n_iters):
                     writer.add_scalar('test/eps_len', player.eps_len, n_iter)
                     break
 
-        # player.max_length:
+        # Calculate averages
         ave_AG = AG/args.test_eps
         ave_reward_sum = reward_sum/args.test_eps
         len_mean = len_sum/args.test_eps
         reward_step = reward_sum / len_sum
         mean_reward = np.mean(reward_sum_list)
         std_reward = np.std(reward_sum_list)
-        episode+=1
+        episode += 1
+        
+        # Update shared episode counter
+        if episode_counter:
+            episode_counter.value = episode
+        
         log['{}_log'.format(args.env)].info(
             "Time {0}, ave eps reward {1}, ave eps length {2}, reward step {3}, FPS {4}, "
             "mean reward {5}, std reward {6}, AG {7}".
@@ -105,34 +133,55 @@ def test(args, shared_model, optimizer, train_modes, n_iters):
                 np.around(reward_step, decimals=2), np.around(np.mean(fps_all), decimals=2),
                 mean_reward, std_reward, np.around(ave_AG, decimals=2)
             ))
-        avg_reward_eps+=ave_reward_sum[0]
+        
+        avg_reward_eps += ave_reward_sum[0]
         result.append(avg_reward_eps/episode)
-#         if episode % 10 == 0:  # Save every 10 iterations
-#                 with open("result6.pkl", "wb") as f:
-#                     pickle.dump(result, f)
-        # save model
+        
+        # ===== THÊM PHẦN NÀY: LƯU CHECKPOINT THEO INTERVAL =====
+        if checkpoint_dir and episode % save_interval == 0:
+            save_checkpoint(args, shared_model, optimizer, episode, n_iter, checkpoint_dir)
+        # ========================================================
+        
+        # Save model
         if ave_reward_sum[0] >= max_score:
             print('save best!')
             max_score = ave_reward_sum[0]
             model_dir = os.path.join(args.log_dir, 'best.pth')
+            # ===== LƯU CHECKPOINT KHI CÓ BEST MODEL =====
+            if checkpoint_dir:
+                save_checkpoint(args, shared_model, optimizer, episode, n_iter, checkpoint_dir)
+            # =========================================
         elif np.mean(ave_reward_sum) >= max_avg_score:
-            print('save best!')
+            print('save best avg!')
             max_avg_score = np.mean(ave_reward_sum)
-            model_dir = os.path.join(args.log_dir, 'best_avg.pth')            
+            model_dir = os.path.join(args.log_dir, 'best_avg.pth')
+            # ===== LƯU CHECKPOINT KHI CÓ BEST AVG MODEL =====
+            if checkpoint_dir:
+                save_checkpoint(args, shared_model, optimizer, episode, n_iter, checkpoint_dir)
+            # =============================================
         else:
             model_dir = os.path.join(args.log_dir, 'new.pth'.format(args.env))
+        
         log['{}_log'.format(args.env)].info(
             "Episode {0} - BEST: {1} | BEST OVERALL: {2} | AVG: {3} | Iter: {4}".
             format(
-                episode,np.around(max_score,decimals=5),np.around(max_avg_score,decimals=5),np.around(avg_reward_eps/episode,decimals=5),n_iter
+                episode, np.around(max_score, decimals=5), np.around(max_avg_score, decimals=5),
+                np.around(avg_reward_eps/episode, decimals=5), n_iter
             ))
+        
         state_to_save = {"model": player.model.state_dict(),
-                         "optimizer": optimizer.state_dict()}
+                         "optimizer": optimizer.state_dict() if optimizer else None}
         torch.save(state_to_save, model_dir)
         time.sleep(args.sleep_time)
+        
         if n_iter > args.max_step:
+            # ===== LƯU FINAL CHECKPOINT TRƯỚC KHI THOÁT =====
+            if checkpoint_dir:
+                save_checkpoint(args, shared_model, optimizer, episode, n_iter, checkpoint_dir)
+                print("Final checkpoint saved!")
+            # ==============================================
+            
             env.close()
             for id in range(0, args.workers):
                 train_modes[id] = -100
             break
-
