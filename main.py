@@ -42,10 +42,61 @@ parser.add_argument('--lstm-out', type=int, default=128, metavar='LO', help='lst
 parser.add_argument('--sleep-time', type=int, default=0, metavar='LO', help='seconds')
 parser.add_argument('--max-step', type=int, default=20000000, metavar='LO', help='max learning steps')
 parser.add_argument('--render_save', dest='render_save', action='store_true', help='render save')
+# Thêm arguments cho checkpoint
+parser.add_argument('--resume', dest='resume', action='store_true', help='resume from checkpoint')
+parser.add_argument('--checkpoint-dir', default=None, metavar='CD', help='checkpoint directory to resume from')
+parser.add_argument('--save-interval', type=int, default=100, metavar='SI', help='save checkpoint every N iterations')
+
+def save_checkpoint(args, shared_model, optimizer, episode, n_iter, checkpoint_dir):
+    """Lưu checkpoint"""
+    if not os.path.exists(checkpoint_dir):
+        os.makedirs(checkpoint_dir)
+    
+    checkpoint_path = os.path.join(checkpoint_dir, 'checkpoint.pth')
+    checkpoint = {
+        'episode': episode,
+        'n_iter': n_iter,
+        'model_state_dict': shared_model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict() if optimizer else None,
+        'args': vars(args)
+    }
+    torch.save(checkpoint, checkpoint_path)
+    print(f"Checkpoint saved at episode {episode}, iteration {n_iter}")
+
+def load_checkpoint(checkpoint_path):
+    """Load checkpoint"""
+    if os.path.exists(checkpoint_path):
+        print(f"Loading checkpoint from {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path, map_location=lambda storage, loc: storage)
+        return checkpoint
+    else:
+        print(f"No checkpoint found at {checkpoint_path}")
+        return None
 
 def start():
     args = parser.parse_args()
     args.shared_optimizer = True
+    
+    # Xác định checkpoint directory
+    if args.resume and args.checkpoint_dir:
+        checkpoint_dir = args.checkpoint_dir
+    else:
+        current_time = datetime.now().strftime('%b%d_%H-%M')
+        checkpoint_dir = os.path.join(args.log_dir, args.env, current_time, 'checkpoints')
+    
+    # Load checkpoint nếu resume
+    start_episode = 0
+    start_n_iter = 0
+    checkpoint = None
+    
+    if args.resume:
+        checkpoint_path = os.path.join(checkpoint_dir, 'checkpoint.pth')
+        checkpoint = load_checkpoint(checkpoint_path)
+        if checkpoint:
+            start_episode = checkpoint['episode']
+            start_n_iter = checkpoint['n_iter']
+            print(f"Resuming from episode {start_episode}, iteration {start_n_iter}")
+    
     if args.gpu_ids == -1:
         torch.manual_seed(args.seed)
         args.gpu_ids = [-1]
@@ -58,13 +109,18 @@ def start():
             device_share = torch.device('cpu')
         else:
             device_share = torch.device('cuda:' + str(args.gpu_ids[-1]))
+    
     env = create_env(args.env, args)
     shared_model = build_model(env.observation_space, env.action_space, args, device_share).to(device_share)
     shared_model.share_memory()
     env.close()
     del env
 
-    if args.load_coordinator_dir is not None:
+    # Load model state
+    if checkpoint:
+        shared_model.load_state_dict(checkpoint['model_state_dict'])
+        print("Model state loaded from checkpoint")
+    elif args.load_coordinator_dir is not None:
         saved_state = torch.load(
             args.load_coordinator_dir,
             map_location=lambda storage, loc: storage)
@@ -72,6 +128,7 @@ def start():
             shared_model.load_state_dict(saved_state['model'], strict=False)
         else:
             shared_model.load_state_dict(saved_state)
+        print(f"Model loaded from {args.load_coordinator_dir}")
 
     params = shared_model.parameters()
     if args.shared_optimizer:
@@ -80,6 +137,12 @@ def start():
             optimizer = SharedRMSprop(params, lr=args.lr)
         if args.optimizer == 'Adam':
             optimizer = SharedAdam(params, lr=args.lr, amsgrad=args.amsgrad)
+        
+        # Load optimizer state from checkpoint
+        if checkpoint and checkpoint['optimizer_state_dict']:
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            print("Optimizer state loaded from checkpoint")
+        
         optimizer.share_memory()
     else:
         optimizer = None
@@ -91,15 +154,22 @@ def start():
     manager = mp.Manager()
     train_modes = manager.list()
     n_iters = manager.list()
+    
+    # Shared values cho checkpoint
+    episode_counter = manager.Value('i', start_episode)
+    should_save_checkpoint = manager.Value('b', False)
 
-
-    p = mp.Process(target=test, args=(args, shared_model, optimizer, train_modes, n_iters))
+    # Test process
+    p = mp.Process(target=test, args=(args, shared_model, optimizer, train_modes, n_iters, 
+                                       episode_counter, checkpoint_dir, args.save_interval))
     p.start()
     processes.append(p)
     time.sleep(args.sleep_time)
 
+    # Training processes
     for rank in range(0, args.workers):
-        p = mp.Process(target=train, args=(rank, args, shared_model, optimizer, train_modes, n_iters))
+        p = mp.Process(target=train, args=(rank, args, shared_model, optimizer, train_modes, 
+                                            n_iters, episode_counter, start_n_iter))
         p.start()
         processes.append(p)
         time.sleep(args.sleep_time)
@@ -111,4 +181,3 @@ def start():
 
 if __name__=='__main__':
     start()
-
