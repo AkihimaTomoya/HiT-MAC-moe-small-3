@@ -2,6 +2,7 @@ from __future__ import division
 from setproctitle import setproctitle as ptitle
 
 import os
+import glob
 import time
 import torch
 import logging
@@ -14,24 +15,48 @@ from player_util import Agent
 from environment import create_env
 
 
-def save_checkpoint(args, model, optimizer, episode, n_iter, checkpoint_dir):
-    """Lưu checkpoint trong quá trình test"""
+def save_checkpoint(args, model, optimizer, episode, n_iter, checkpoint_dir, keep_last=3):
+    """
+    Lưu checkpoint và tự động xóa checkpoint cũ
+    Giữ lại {keep_last} checkpoint gần nhất
+    """
     if not os.path.exists(checkpoint_dir):
         os.makedirs(checkpoint_dir)
     
-    checkpoint_path = os.path.join(checkpoint_dir, 'checkpoint.pth')
     checkpoint = {
         'episode': episode,
         'n_iter': n_iter,
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict() if optimizer else None,
     }
-    torch.save(checkpoint, checkpoint_path)
+    
+    # 1. Lưu checkpoint mới nhất (luôn ghi đè)
+    latest_path = os.path.join(checkpoint_dir, 'checkpoint.pth')
+    torch.save(checkpoint, latest_path)
+    
+    # 2. Lưu checkpoint theo episode (không ghi đè)
+    episode_path = os.path.join(checkpoint_dir, f'checkpoint_ep{episode}.pth')
+    torch.save(checkpoint, episode_path)
+    
+    # 3. Xóa checkpoint cũ, chỉ giữ {keep_last} checkpoint
+    checkpoints = glob.glob(os.path.join(checkpoint_dir, 'checkpoint_ep*.pth'))
+    # Sắp xếp theo thời gian tạo, mới nhất trước
+    checkpoints.sort(key=lambda x: os.path.getmtime(x), reverse=True)
+    
+    # Xóa các checkpoint cũ (giữ lại keep_last checkpoint)
+    for old_checkpoint in checkpoints[keep_last:]:
+        try:
+            os.remove(old_checkpoint)
+            print(f"[Test] Removed old checkpoint: {os.path.basename(old_checkpoint)}")
+        except Exception as e:
+            print(f"[Test] Failed to remove {old_checkpoint}: {e}")
+    
     print(f"[Test] Checkpoint saved at episode {episode}, iteration {n_iter}")
+    print(f"       Kept {min(len(checkpoints), keep_last)} checkpoint(s)")
 
 
 def test(args, shared_model, optimizer, train_modes, n_iters, episode_counter=None, 
-         checkpoint_dir=None, save_interval=100):
+         checkpoint_dir=None, save_interval=100, keep_checkpoints=3):
     ptitle('Test Agent')
     n_iter = 0
     writer = SummaryWriter(os.path.join(args.log_dir, 'Test'))
@@ -137,28 +162,25 @@ def test(args, shared_model, optimizer, train_modes, n_iters, episode_counter=No
         avg_reward_eps += ave_reward_sum[0]
         result.append(avg_reward_eps/episode)
         
-        # ===== THÊM PHẦN NÀY: LƯU CHECKPOINT THEO INTERVAL =====
+        # Lưu checkpoint theo interval
         if checkpoint_dir and episode % save_interval == 0:
-            save_checkpoint(args, shared_model, optimizer, episode, n_iter, checkpoint_dir)
-        # ========================================================
+            save_checkpoint(args, shared_model, optimizer, episode, n_iter, checkpoint_dir, keep_checkpoints)
         
         # Save model
         if ave_reward_sum[0] >= max_score:
             print('save best!')
             max_score = ave_reward_sum[0]
             model_dir = os.path.join(args.log_dir, 'best.pth')
-            # ===== LƯU CHECKPOINT KHI CÓ BEST MODEL =====
+            # Lưu checkpoint khi có best model
             if checkpoint_dir:
-                save_checkpoint(args, shared_model, optimizer, episode, n_iter, checkpoint_dir)
-            # =========================================
+                save_checkpoint(args, shared_model, optimizer, episode, n_iter, checkpoint_dir, keep_checkpoints)
         elif np.mean(ave_reward_sum) >= max_avg_score:
             print('save best avg!')
             max_avg_score = np.mean(ave_reward_sum)
             model_dir = os.path.join(args.log_dir, 'best_avg.pth')
-            # ===== LƯU CHECKPOINT KHI CÓ BEST AVG MODEL =====
+            # Lưu checkpoint khi có best avg model
             if checkpoint_dir:
-                save_checkpoint(args, shared_model, optimizer, episode, n_iter, checkpoint_dir)
-            # =============================================
+                save_checkpoint(args, shared_model, optimizer, episode, n_iter, checkpoint_dir, keep_checkpoints)
         else:
             model_dir = os.path.join(args.log_dir, 'new.pth'.format(args.env))
         
@@ -175,11 +197,10 @@ def test(args, shared_model, optimizer, train_modes, n_iters, episode_counter=No
         time.sleep(args.sleep_time)
         
         if n_iter > args.max_step:
-            # ===== LƯU FINAL CHECKPOINT TRƯỚC KHI THOÁT =====
+            # Lưu final checkpoint trước khi thoát
             if checkpoint_dir:
-                save_checkpoint(args, shared_model, optimizer, episode, n_iter, checkpoint_dir)
+                save_checkpoint(args, shared_model, optimizer, episode, n_iter, checkpoint_dir, keep_checkpoints)
                 print("Final checkpoint saved!")
-            # ==============================================
             
             env.close()
             for id in range(0, args.workers):
