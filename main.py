@@ -1,5 +1,6 @@
 from __future__ import print_function, division
 import os
+import glob
 import time
 import torch
 import argparse
@@ -46,13 +47,16 @@ parser.add_argument('--render_save', dest='render_save', action='store_true', he
 parser.add_argument('--resume', dest='resume', action='store_true', help='resume from checkpoint')
 parser.add_argument('--checkpoint-dir', default=None, metavar='CD', help='checkpoint directory to resume from')
 parser.add_argument('--save-interval', type=int, default=100, metavar='SI', help='save checkpoint every N iterations')
+parser.add_argument('--keep-checkpoints', type=int, default=3, metavar='KC', help='number of checkpoints to keep (default: 3)')
 
-def save_checkpoint(args, shared_model, optimizer, episode, n_iter, checkpoint_dir):
-    """Lưu checkpoint"""
+def save_checkpoint(args, shared_model, optimizer, episode, n_iter, checkpoint_dir, keep_last=3):
+    """
+    Lưu checkpoint và tự động xóa checkpoint cũ
+    Giữ lại {keep_last} checkpoint gần nhất
+    """
     if not os.path.exists(checkpoint_dir):
         os.makedirs(checkpoint_dir)
     
-    checkpoint_path = os.path.join(checkpoint_dir, 'checkpoint.pth')
     checkpoint = {
         'episode': episode,
         'n_iter': n_iter,
@@ -60,8 +64,30 @@ def save_checkpoint(args, shared_model, optimizer, episode, n_iter, checkpoint_d
         'optimizer_state_dict': optimizer.state_dict() if optimizer else None,
         'args': vars(args)
     }
-    torch.save(checkpoint, checkpoint_path)
-    print(f"Checkpoint saved at episode {episode}, iteration {n_iter}")
+    
+    # 1. Lưu checkpoint mới nhất (luôn ghi đè)
+    latest_path = os.path.join(checkpoint_dir, 'checkpoint.pth')
+    torch.save(checkpoint, latest_path)
+    
+    # 2. Lưu checkpoint theo episode (không ghi đè)
+    episode_path = os.path.join(checkpoint_dir, f'checkpoint_ep{episode}.pth')
+    torch.save(checkpoint, episode_path)
+    
+    # 3. Xóa checkpoint cũ, chỉ giữ {keep_last} checkpoint
+    checkpoints = glob.glob(os.path.join(checkpoint_dir, 'checkpoint_ep*.pth'))
+    # Sắp xếp theo thời gian tạo, mới nhất trước
+    checkpoints.sort(key=lambda x: os.path.getmtime(x), reverse=True)
+    
+    # Xóa các checkpoint cũ (giữ lại keep_last checkpoint)
+    for old_checkpoint in checkpoints[keep_last:]:
+        try:
+            os.remove(old_checkpoint)
+            print(f"[Main] Removed old checkpoint: {os.path.basename(old_checkpoint)}")
+        except Exception as e:
+            print(f"[Main] Failed to remove {old_checkpoint}: {e}")
+    
+    print(f"[Main] Checkpoint saved at episode {episode}, iteration {n_iter}")
+    print(f"       Kept {min(len(checkpoints), keep_last)} checkpoint(s)")
 
 def load_checkpoint(checkpoint_path):
     """Load checkpoint"""
@@ -147,8 +173,15 @@ def start():
     else:
         optimizer = None
 
-    current_time = datetime.now().strftime('%b%d_%H-%M')
-    args.log_dir = os.path.join(args.log_dir, args.env, current_time)
+    # Nếu resume, giữ nguyên log_dir từ checkpoint_dir
+    if args.resume and args.checkpoint_dir:
+        # Lấy parent directory của checkpoints: logs/Pose-v0/Jan12_04-09
+        args.log_dir = os.path.dirname(checkpoint_dir)
+        print(f"Resuming: Using existing log directory: {args.log_dir}")
+    else:
+        current_time = datetime.now().strftime('%b%d_%H-%M')
+        args.log_dir = os.path.join(args.log_dir, args.env, current_time)
+        print(f"New training: Creating log directory: {args.log_dir}")
 
     processes = []
     manager = mp.Manager()
@@ -157,11 +190,11 @@ def start():
     
     # Shared values cho checkpoint
     episode_counter = manager.Value('i', start_episode)
-    should_save_checkpoint = manager.Value('b', False)
 
     # Test process
     p = mp.Process(target=test, args=(args, shared_model, optimizer, train_modes, n_iters, 
-                                       episode_counter, checkpoint_dir, args.save_interval))
+                                       episode_counter, checkpoint_dir, args.save_interval, 
+                                       args.keep_checkpoints))
     p.start()
     processes.append(p)
     time.sleep(args.sleep_time)
