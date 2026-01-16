@@ -43,11 +43,11 @@ parser.add_argument('--lstm-out', type=int, default=128, metavar='LO', help='lst
 parser.add_argument('--sleep-time', type=int, default=0, metavar='LO', help='seconds')
 parser.add_argument('--max-step', type=int, default=20000000, metavar='LO', help='max learning steps')
 parser.add_argument('--render_save', dest='render_save', action='store_true', help='render save')
-# Thêm arguments cho checkpoint
 parser.add_argument('--resume', dest='resume', action='store_true', help='resume from checkpoint')
 parser.add_argument('--checkpoint-dir', default=None, metavar='CD', help='checkpoint directory to resume from')
-parser.add_argument('--save-interval', type=int, default=100, metavar='SI', help='save checkpoint every N iterations')
+parser.add_argument('--save-interval', type=int, default=100, metavar='SI', help='save checkpoint every N episodes')
 parser.add_argument('--keep-checkpoints', type=int, default=3, metavar='KC', help='number of checkpoints to keep (default: 3)')
+parser.add_argument('--checkpoint-file', default=None, metavar='CF', help='specific checkpoint file to load (e.g., checkpoint_ep214000.pth)')
 
 def save_checkpoint(args, shared_model, optimizer, episode, n_iter, checkpoint_dir, keep_last=3):
     """
@@ -62,21 +62,30 @@ def save_checkpoint(args, shared_model, optimizer, episode, n_iter, checkpoint_d
         'n_iter': n_iter,
         'model_state_dict': shared_model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict() if optimizer else None,
-        'args': vars(args)
+        'args': vars(args),
+        'log_dir': args.log_dir  # Lưu log_dir để resume đúng
     }
     
     # 1. Lưu checkpoint mới nhất (luôn ghi đè)
     latest_path = os.path.join(checkpoint_dir, 'checkpoint.pth')
     torch.save(checkpoint, latest_path)
+    print(f"[Main] Saved latest checkpoint: checkpoint.pth")
     
     # 2. Lưu checkpoint theo episode (không ghi đè)
     episode_path = os.path.join(checkpoint_dir, f'checkpoint_ep{episode}.pth')
     torch.save(checkpoint, episode_path)
+    print(f"[Main] Saved episode checkpoint: checkpoint_ep{episode}.pth")
     
     # 3. Xóa checkpoint cũ, chỉ giữ {keep_last} checkpoint
     checkpoints = glob.glob(os.path.join(checkpoint_dir, 'checkpoint_ep*.pth'))
-    # Sắp xếp theo thời gian tạo, mới nhất trước
-    checkpoints.sort(key=lambda x: os.path.getmtime(x), reverse=True)
+    # Sắp xếp theo episode number, mới nhất trước
+    def get_episode_number(path):
+        try:
+            return int(path.split('_ep')[-1].split('.pth')[0])
+        except:
+            return 0
+    
+    checkpoints.sort(key=get_episode_number, reverse=True)
     
     # Xóa các checkpoint cũ (giữ lại keep_last checkpoint)
     for old_checkpoint in checkpoints[keep_last:]:
@@ -89,15 +98,61 @@ def save_checkpoint(args, shared_model, optimizer, episode, n_iter, checkpoint_d
     print(f"[Main] Checkpoint saved at episode {episode}, iteration {n_iter}")
     print(f"       Kept {min(len(checkpoints), keep_last)} checkpoint(s)")
 
-def load_checkpoint(checkpoint_path):
-    """Load checkpoint"""
-    if os.path.exists(checkpoint_path):
-        print(f"Loading checkpoint from {checkpoint_path}")
-        checkpoint = torch.load(checkpoint_path, map_location=lambda storage, loc: storage)
+def load_checkpoint(checkpoint_dir, checkpoint_file=None):
+    """Load checkpoint - tự động tìm checkpoint mới nhất"""
+    
+    # Hiển thị danh sách checkpoints có sẵn
+    all_checkpoints = glob.glob(os.path.join(checkpoint_dir, 'checkpoint*.pth'))
+    if all_checkpoints:
+        print(f"\n📁 Available checkpoints in {checkpoint_dir}:")
+        for ckpt in sorted(all_checkpoints):
+            try:
+                size_mb = os.path.getsize(ckpt) / (1024 * 1024)
+                print(f"   - {os.path.basename(ckpt)} ({size_mb:.2f} MB)")
+            except:
+                print(f"   - {os.path.basename(ckpt)}")
+        print()
+    
+    # Option 1: User chỉ định file cụ thể
+    if checkpoint_file:
+        checkpoint_path = os.path.join(checkpoint_dir, checkpoint_file)
+        if os.path.exists(checkpoint_path):
+            print(f"✓ Loading specified checkpoint: {checkpoint_file}")
+            checkpoint = torch.load(checkpoint_path, map_location=lambda storage, loc: storage)
+            return checkpoint
+        else:
+            print(f"✗ Specified checkpoint not found: {checkpoint_file}")
+    
+    # Option 2: Tìm checkpoint.pth (checkpoint mới nhất)
+    latest_path = os.path.join(checkpoint_dir, 'checkpoint.pth')
+    if os.path.exists(latest_path):
+        print(f"✓ Loading latest checkpoint: checkpoint.pth")
+        checkpoint = torch.load(latest_path, map_location=lambda storage, loc: storage)
         return checkpoint
-    else:
-        print(f"No checkpoint found at {checkpoint_path}")
+    
+    # Option 3: Tìm checkpoint_epXXX.pth mới nhất
+    checkpoints = glob.glob(os.path.join(checkpoint_dir, 'checkpoint_ep*.pth'))
+    
+    if not checkpoints:
+        print(f"✗ No checkpoint found in {checkpoint_dir}")
         return None
+    
+    # Sắp xếp theo episode number
+    def get_episode_number(path):
+        try:
+            return int(path.split('_ep')[-1].split('.pth')[0])
+        except:
+            return 0
+    
+    checkpoints.sort(key=get_episode_number, reverse=True)
+    
+    # Load checkpoint mới nhất
+    latest_checkpoint = checkpoints[0]
+    episode_num = get_episode_number(latest_checkpoint)
+    print(f"✓ Loading latest checkpoint (episode {episode_num}): {os.path.basename(latest_checkpoint)}")
+    checkpoint = torch.load(latest_checkpoint, map_location=lambda storage, loc: storage)
+    
+    return checkpoint
 
 def start():
     args = parser.parse_args()
@@ -116,12 +171,35 @@ def start():
     checkpoint = None
     
     if args.resume:
-        checkpoint_path = os.path.join(checkpoint_dir, 'checkpoint.pth')
-        checkpoint = load_checkpoint(checkpoint_path)
+        checkpoint = load_checkpoint(checkpoint_dir, args.checkpoint_file)
         if checkpoint:
-            start_episode = checkpoint['episode']
-            start_n_iter = checkpoint['n_iter']
-            print(f"Resuming from episode {start_episode}, iteration {start_n_iter}")
+            start_episode = checkpoint.get('episode', 0)
+            start_n_iter = checkpoint.get('n_iter', 0)
+            print(f"\n✓ Successfully loaded checkpoint!")
+            print(f"  - Episode: {start_episode}")
+            print(f"  - Iteration: {start_n_iter}")
+            
+            # Load log_dir nếu có trong checkpoint
+            if 'log_dir' in checkpoint:
+                args.log_dir = checkpoint['log_dir']
+                print(f"  - Log directory: {args.log_dir}")
+            else:
+                # Nếu không có log_dir trong checkpoint, dùng parent của checkpoint_dir
+                args.log_dir = os.path.dirname(checkpoint_dir)
+                print(f"  - Log directory (inferred): {args.log_dir}")
+        else:
+            print("\n⚠ No checkpoint found, starting fresh training")
+            args.resume = False
+            current_time = datetime.now().strftime('%b%d_%H-%M')
+            args.log_dir = os.path.join(args.log_dir, args.env, current_time)
+            checkpoint_dir = os.path.join(args.log_dir, 'checkpoints')
+    else:
+        # Training mới
+        current_time = datetime.now().strftime('%b%d_%H-%M')
+        args.log_dir = os.path.join(args.log_dir, args.env, current_time)
+        checkpoint_dir = os.path.join(args.log_dir, 'checkpoints')
+        print(f"\n✓ Starting new training")
+        print(f"  - Log directory: {args.log_dir}")
     
     if args.gpu_ids == -1:
         torch.manual_seed(args.seed)
@@ -142,10 +220,10 @@ def start():
     env.close()
     del env
 
-    # Load model state
+    # Load model state từ checkpoint
     if checkpoint:
         shared_model.load_state_dict(checkpoint['model_state_dict'])
-        print("Model state loaded from checkpoint")
+        print("✓ Model state loaded from checkpoint")
     elif args.load_coordinator_dir is not None:
         saved_state = torch.load(
             args.load_coordinator_dir,
@@ -154,42 +232,41 @@ def start():
             shared_model.load_state_dict(saved_state['model'], strict=False)
         else:
             shared_model.load_state_dict(saved_state)
-        print(f"Model loaded from {args.load_coordinator_dir}")
+        print(f"✓ Model loaded from {args.load_coordinator_dir}")
 
     params = shared_model.parameters()
     if args.shared_optimizer:
-        print('share memory')
+        print('✓ Using shared optimizer')
         if args.optimizer == 'RMSprop':
             optimizer = SharedRMSprop(params, lr=args.lr)
         if args.optimizer == 'Adam':
             optimizer = SharedAdam(params, lr=args.lr, amsgrad=args.amsgrad)
         
-        # Load optimizer state from checkpoint
-        if checkpoint and checkpoint['optimizer_state_dict']:
+        # Load optimizer state từ checkpoint
+        if checkpoint and checkpoint.get('optimizer_state_dict'):
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            print("Optimizer state loaded from checkpoint")
+            print("✓ Optimizer state loaded from checkpoint")
         
         optimizer.share_memory()
     else:
         optimizer = None
-
-    # Nếu resume, giữ nguyên log_dir từ checkpoint_dir
-    if args.resume and args.checkpoint_dir:
-        # Lấy parent directory của checkpoints: logs/Pose-v0/Jan12_04-09
-        args.log_dir = os.path.dirname(checkpoint_dir)
-        print(f"Resuming: Using existing log directory: {args.log_dir}")
-    else:
-        current_time = datetime.now().strftime('%b%d_%H-%M')
-        args.log_dir = os.path.join(args.log_dir, args.env, current_time)
-        print(f"New training: Creating log directory: {args.log_dir}")
 
     processes = []
     manager = mp.Manager()
     train_modes = manager.list()
     n_iters = manager.list()
     
-    # Shared values cho checkpoint
+    # Shared values cho checkpoint - QUAN TRỌNG: Khởi tạo từ checkpoint
     episode_counter = manager.Value('i', start_episode)
+    
+    print(f"\n{'='*60}")
+    print(f"Starting training with:")
+    print(f"  - Initial episode: {start_episode}")
+    print(f"  - Initial iteration: {start_n_iter}")
+    print(f"  - Checkpoint directory: {checkpoint_dir}")
+    print(f"  - Save interval: {args.save_interval} episodes")
+    print(f"  - Keep checkpoints: {args.keep_checkpoints}")
+    print(f"{'='*60}\n")
 
     # Test process
     p = mp.Process(target=test, args=(args, shared_model, optimizer, train_modes, n_iters, 
