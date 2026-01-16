@@ -28,6 +28,7 @@ def save_checkpoint(args, model, optimizer, episode, n_iter, checkpoint_dir, kee
         'n_iter': n_iter,
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict() if optimizer else None,
+        'log_dir': args.log_dir  # Lưu log_dir
     }
     
     # 1. Lưu checkpoint mới nhất (luôn ghi đè)
@@ -40,8 +41,15 @@ def save_checkpoint(args, model, optimizer, episode, n_iter, checkpoint_dir, kee
     
     # 3. Xóa checkpoint cũ, chỉ giữ {keep_last} checkpoint
     checkpoints = glob.glob(os.path.join(checkpoint_dir, 'checkpoint_ep*.pth'))
-    # Sắp xếp theo thời gian tạo, mới nhất trước
-    checkpoints.sort(key=lambda x: os.path.getmtime(x), reverse=True)
+    
+    # Sắp xếp theo episode number, mới nhất trước
+    def get_episode_number(path):
+        try:
+            return int(path.split('_ep')[-1].split('.pth')[0])
+        except:
+            return 0
+    
+    checkpoints.sort(key=get_episode_number, reverse=True)
     
     # Xóa các checkpoint cũ (giữ lại keep_last checkpoint)
     for old_checkpoint in checkpoints[keep_last:]:
@@ -89,8 +97,11 @@ def test(args, shared_model, optimizer, train_modes, n_iters, episode_counter=No
     max_score = -100
     max_avg_score = -100
     
-    # Load episode counter từ checkpoint nếu có
+    # QUAN TRỌNG: Load episode counter từ shared value
     episode = episode_counter.value if episode_counter else 0
+    initial_episode = episode
+    
+    print(f"\n[Test] Starting test loop from episode {episode}")
     
     avg_reward_eps = 0
     result = []
@@ -143,17 +154,20 @@ def test(args, shared_model, optimizer, train_modes, n_iters, episode_counter=No
         reward_step = reward_sum / len_sum
         mean_reward = np.mean(reward_sum_list)
         std_reward = np.std(reward_sum_list)
+        
+        # QUAN TRỌNG: Tăng episode counter
         episode += 1
         
-        # Update shared episode counter
+        # QUAN TRỌNG: Cập nhật shared episode counter
         if episode_counter:
             episode_counter.value = episode
         
         log['{}_log'.format(args.env)].info(
-            "Time {0}, ave eps reward {1}, ave eps length {2}, reward step {3}, FPS {4}, "
-            "mean reward {5}, std reward {6}, AG {7}".
+            "Time {0}, Episode {1}, ave eps reward {2}, ave eps length {3}, reward step {4}, FPS {5}, "
+            "mean reward {6}, std reward {7}, AG {8}".
             format(
                 time.strftime("%Hh %Mm %Ss", time.gmtime(time.time() - start_time)),
+                episode,
                 np.around(ave_reward_sum, decimals=2), np.around(len_mean, decimals=2),
                 np.around(reward_step, decimals=2), np.around(np.mean(fps_all), decimals=2),
                 mean_reward, std_reward, np.around(ave_AG, decimals=2)
@@ -163,26 +177,29 @@ def test(args, shared_model, optimizer, train_modes, n_iters, episode_counter=No
         result.append(avg_reward_eps/episode)
         
         # Lưu checkpoint theo interval
-        if checkpoint_dir and episode % save_interval == 0:
+        if checkpoint_dir and (episode - initial_episode) % save_interval == 0 and episode > initial_episode:
             save_checkpoint(args, shared_model, optimizer, episode, n_iter, checkpoint_dir, keep_checkpoints)
+            print(f"[Test] Regular checkpoint saved (interval: {save_interval})")
         
         # Save model
+        save_model = False
         if ave_reward_sum[0] >= max_score:
-            print('save best!')
+            print(f'[Test] New best score: {max_score:.5f} -> {ave_reward_sum[0]:.5f}')
             max_score = ave_reward_sum[0]
             model_dir = os.path.join(args.log_dir, 'best.pth')
-            # Lưu checkpoint khi có best model
-            if checkpoint_dir:
-                save_checkpoint(args, shared_model, optimizer, episode, n_iter, checkpoint_dir, keep_checkpoints)
+            save_model = True
         elif np.mean(ave_reward_sum) >= max_avg_score:
-            print('save best avg!')
+            print(f'[Test] New best avg score: {max_avg_score:.5f} -> {np.mean(ave_reward_sum):.5f}')
             max_avg_score = np.mean(ave_reward_sum)
             model_dir = os.path.join(args.log_dir, 'best_avg.pth')
-            # Lưu checkpoint khi có best avg model
-            if checkpoint_dir:
-                save_checkpoint(args, shared_model, optimizer, episode, n_iter, checkpoint_dir, keep_checkpoints)
+            save_model = True
         else:
             model_dir = os.path.join(args.log_dir, 'new.pth'.format(args.env))
+        
+        # Lưu checkpoint khi có best model
+        if save_model and checkpoint_dir:
+            save_checkpoint(args, shared_model, optimizer, episode, n_iter, checkpoint_dir, keep_checkpoints)
+            print(f"[Test] Best model checkpoint saved at episode {episode}")
         
         log['{}_log'.format(args.env)].info(
             "Episode {0} - BEST: {1} | BEST OVERALL: {2} | AVG: {3} | Iter: {4}".
@@ -200,7 +217,7 @@ def test(args, shared_model, optimizer, train_modes, n_iters, episode_counter=No
             # Lưu final checkpoint trước khi thoát
             if checkpoint_dir:
                 save_checkpoint(args, shared_model, optimizer, episode, n_iter, checkpoint_dir, keep_checkpoints)
-                print("Final checkpoint saved!")
+                print("[Test] Final checkpoint saved!")
             
             env.close()
             for id in range(0, args.workers):
