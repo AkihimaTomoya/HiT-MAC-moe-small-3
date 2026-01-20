@@ -7,10 +7,24 @@ import numpy as np
 from torch.autograd import Variable
 
 
-def setup_logger(logger_name, log_file, level=logging.INFO):
+def setup_logger(logger_name, log_file, level=logging.INFO, mode='w'):
+    """
+    Setup logger with specified mode
+    
+    Args:
+        logger_name: Name of the logger
+        log_file: Path to log file
+        level: Logging level (default: logging.INFO)
+        mode: File mode - 'w' for write (overwrite), 'a' for append (default: 'w')
+    """
     l = logging.getLogger(logger_name)
+    
+    # Clear existing handlers to avoid duplicate logs
+    if l.hasHandlers():
+        l.handlers.clear()
+    
     formatter = logging.Formatter('%(asctime)s : %(message)s')
-    fileHandler = logging.FileHandler(log_file, mode='w')
+    fileHandler = logging.FileHandler(log_file, mode=mode)
     fileHandler.setFormatter(formatter)
     streamHandler = logging.StreamHandler()
     streamHandler.setFormatter(formatter)
