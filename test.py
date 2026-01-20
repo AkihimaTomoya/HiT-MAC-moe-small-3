@@ -5,6 +5,7 @@ import os
 import glob
 import time
 import torch
+import shutil
 import logging
 import numpy as np
 from tensorboardX import SummaryWriter
@@ -17,8 +18,7 @@ from environment import create_env
 
 def save_checkpoint(args, model, optimizer, episode, n_iter, checkpoint_dir, keep_last=3):
     """
-    Lưu checkpoint và tự động xóa checkpoint cũ
-    Giữ lại {keep_last} checkpoint gần nhất
+    Lưu checkpoint và logger files
     """
     if not os.path.exists(checkpoint_dir):
         os.makedirs(checkpoint_dir)
@@ -28,7 +28,7 @@ def save_checkpoint(args, model, optimizer, episode, n_iter, checkpoint_dir, kee
         'n_iter': n_iter,
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict() if optimizer else None,
-        'log_dir': args.log_dir  # Lưu log_dir
+        'log_dir': args.log_dir
     }
     
     # 1. Lưu checkpoint mới nhất (luôn ghi đè)
@@ -39,10 +39,29 @@ def save_checkpoint(args, model, optimizer, episode, n_iter, checkpoint_dir, kee
     episode_path = os.path.join(checkpoint_dir, f'checkpoint_ep{episode}.pth')
     torch.save(checkpoint, episode_path)
     
-    # 3. Xóa checkpoint cũ, chỉ giữ {keep_last} checkpoint
+    # 3. Backup logger files
+    logger_dir = os.path.join(args.log_dir, 'logger')
+    if os.path.exists(logger_dir):
+        logger_backup_dir = os.path.join(checkpoint_dir, 'logger_backups')
+        if not os.path.exists(logger_backup_dir):
+            os.makedirs(logger_backup_dir)
+        
+        # Copy logger file với tên theo episode
+        logger_file = os.path.join(logger_dir, f'{args.env}_log')
+        if os.path.exists(logger_file):
+            # Backup theo episode
+            logger_backup_file = os.path.join(logger_backup_dir, f'logger_ep{episode}.log')
+            shutil.copy2(logger_file, logger_backup_file)
+            
+            # Backup latest
+            latest_logger = os.path.join(logger_backup_dir, 'latest_logger.log')
+            shutil.copy2(logger_file, latest_logger)
+            
+            print(f"[Test] Backed up logger: logger_ep{episode}.log")
+    
+    # 4. Xóa checkpoint cũ
     checkpoints = glob.glob(os.path.join(checkpoint_dir, 'checkpoint_ep*.pth'))
     
-    # Sắp xếp theo episode number, mới nhất trước
     def get_episode_number(path):
         try:
             return int(path.split('_ep')[-1].split('.pth')[0])
@@ -51,11 +70,19 @@ def save_checkpoint(args, model, optimizer, episode, n_iter, checkpoint_dir, kee
     
     checkpoints.sort(key=get_episode_number, reverse=True)
     
-    # Xóa các checkpoint cũ (giữ lại keep_last checkpoint)
+    # Xóa các checkpoint và logger cũ
+    logger_backup_dir = os.path.join(checkpoint_dir, 'logger_backups')
     for old_checkpoint in checkpoints[keep_last:]:
         try:
+            ep_num = get_episode_number(old_checkpoint)
             os.remove(old_checkpoint)
             print(f"[Test] Removed old checkpoint: {os.path.basename(old_checkpoint)}")
+            
+            # Xóa logger backup tương ứng
+            old_logger = os.path.join(logger_backup_dir, f'logger_ep{ep_num}.log')
+            if os.path.exists(old_logger):
+                os.remove(old_logger)
+                print(f"[Test] Removed old logger: logger_ep{ep_num}.log")
         except Exception as e:
             print(f"[Test] Failed to remove {old_checkpoint}: {e}")
     
@@ -70,10 +97,30 @@ def test(args, shared_model, optimizer, train_modes, n_iters, episode_counter=No
     writer = SummaryWriter(os.path.join(args.log_dir, 'Test'))
     gpu_id = args.gpu_ids[-1]
     log = {}
-    setup_logger('{}_log'.format(args.env),
-                 r'{0}/logger'.format(args.log_dir))
-    log['{}_log'.format(args.env)] = logging.getLogger(
-        '{}_log'.format(args.env))
+    
+    # Setup logger với append mode nếu resume
+    logger_dir = os.path.join(args.log_dir, 'logger')
+    logger_file = os.path.join(logger_dir, f'{args.env}_log')
+    
+    # Kiểm tra nếu đang resume và logger file đã tồn tại
+    if args.resume and os.path.exists(logger_file):
+        # Logger file đã được restore từ checkpoint, sử dụng append mode
+        setup_logger('{}_log'.format(args.env),
+                     logger_file,
+                     mode='a')  # Append mode
+        print(f"[Test] Continuing existing logger at: {logger_file}")
+    else:
+        # Tạo logger mới với write mode
+        if not os.path.exists(logger_dir):
+            os.makedirs(logger_dir)
+        setup_logger('{}_log'.format(args.env),
+                     logger_file,
+                     mode='w')  # Write mode
+        print(f"[Test] Created new logger at: {logger_file}")
+    
+    log['{}_log'.format(args.env)] = logging.getLogger('{}_log'.format(args.env))
+    
+    # Log args
     d_args = vars(args)
     for k in d_args.keys():
         log['{}_log'.format(args.env)].info('{0}: {1}'.format(k, d_args[k]))
@@ -97,7 +144,7 @@ def test(args, shared_model, optimizer, train_modes, n_iters, episode_counter=No
     max_score = -100
     max_avg_score = -100
     
-    # QUAN TRỌNG: Load episode counter từ shared value
+    # Load episode counter từ shared value
     episode = episode_counter.value if episode_counter else 0
     initial_episode = episode
     
@@ -155,10 +202,10 @@ def test(args, shared_model, optimizer, train_modes, n_iters, episode_counter=No
         mean_reward = np.mean(reward_sum_list)
         std_reward = np.std(reward_sum_list)
         
-        # QUAN TRỌNG: Tăng episode counter
+        # Tăng episode counter
         episode += 1
         
-        # QUAN TRỌNG: Cập nhật shared episode counter
+        # Cập nhật shared episode counter
         if episode_counter:
             episode_counter.value = episode
         
