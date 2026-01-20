@@ -4,6 +4,7 @@ import glob
 import time
 import torch
 import argparse
+import shutil
 from datetime import datetime
 import torch.multiprocessing as mp
 
@@ -51,8 +52,7 @@ parser.add_argument('--checkpoint-file', default=None, metavar='CF', help='speci
 
 def save_checkpoint(args, shared_model, optimizer, episode, n_iter, checkpoint_dir, keep_last=3):
     """
-    Lưu checkpoint và tự động xóa checkpoint cũ
-    Giữ lại {keep_last} checkpoint gần nhất
+    Lưu checkpoint và logger files
     """
     if not os.path.exists(checkpoint_dir):
         os.makedirs(checkpoint_dir)
@@ -63,7 +63,7 @@ def save_checkpoint(args, shared_model, optimizer, episode, n_iter, checkpoint_d
         'model_state_dict': shared_model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict() if optimizer else None,
         'args': vars(args),
-        'log_dir': args.log_dir  # Lưu log_dir để resume đúng
+        'log_dir': args.log_dir
     }
     
     # 1. Lưu checkpoint mới nhất (luôn ghi đè)
@@ -76,9 +76,28 @@ def save_checkpoint(args, shared_model, optimizer, episode, n_iter, checkpoint_d
     torch.save(checkpoint, episode_path)
     print(f"[Main] Saved episode checkpoint: checkpoint_ep{episode}.pth")
     
-    # 3. Xóa checkpoint cũ, chỉ giữ {keep_last} checkpoint
+    # 3. Backup logger files
+    logger_dir = os.path.join(args.log_dir, 'logger')
+    if os.path.exists(logger_dir):
+        # Tạo thư mục backup cho logger
+        logger_backup_dir = os.path.join(checkpoint_dir, 'logger_backups')
+        if not os.path.exists(logger_backup_dir):
+            os.makedirs(logger_backup_dir)
+        
+        # Copy logger file với tên theo episode
+        logger_file = os.path.join(logger_dir, f'{args.env}_log')
+        if os.path.exists(logger_file):
+            logger_backup_file = os.path.join(logger_backup_dir, f'logger_ep{episode}.log')
+            shutil.copy2(logger_file, logger_backup_file)
+            print(f"[Main] Backed up logger: logger_ep{episode}.log")
+            
+            # Cũng lưu bản latest
+            latest_logger = os.path.join(logger_backup_dir, 'latest_logger.log')
+            shutil.copy2(logger_file, latest_logger)
+    
+    # 4. Xóa checkpoint cũ, chỉ giữ {keep_last} checkpoint
     checkpoints = glob.glob(os.path.join(checkpoint_dir, 'checkpoint_ep*.pth'))
-    # Sắp xếp theo episode number, mới nhất trước
+    
     def get_episode_number(path):
         try:
             return int(path.split('_ep')[-1].split('.pth')[0])
@@ -87,11 +106,18 @@ def save_checkpoint(args, shared_model, optimizer, episode, n_iter, checkpoint_d
     
     checkpoints.sort(key=get_episode_number, reverse=True)
     
-    # Xóa các checkpoint cũ (giữ lại keep_last checkpoint)
+    # Xóa các checkpoint cũ
     for old_checkpoint in checkpoints[keep_last:]:
         try:
+            ep_num = get_episode_number(old_checkpoint)
             os.remove(old_checkpoint)
             print(f"[Main] Removed old checkpoint: {os.path.basename(old_checkpoint)}")
+            
+            # Xóa logger backup tương ứng
+            old_logger = os.path.join(logger_backup_dir, f'logger_ep{ep_num}.log')
+            if os.path.exists(old_logger):
+                os.remove(old_logger)
+                print(f"[Main] Removed old logger: logger_ep{ep_num}.log")
         except Exception as e:
             print(f"[Main] Failed to remove {old_checkpoint}: {e}")
     
@@ -99,9 +125,8 @@ def save_checkpoint(args, shared_model, optimizer, episode, n_iter, checkpoint_d
     print(f"       Kept {min(len(checkpoints), keep_last)} checkpoint(s)")
 
 def load_checkpoint(checkpoint_dir, checkpoint_file=None):
-    """Load checkpoint - tự động tìm checkpoint mới nhất"""
+    """Load checkpoint"""
     
-    # Hiển thị danh sách checkpoints có sẵn
     all_checkpoints = glob.glob(os.path.join(checkpoint_dir, 'checkpoint*.pth'))
     if all_checkpoints:
         print(f"\n📁 Available checkpoints in {checkpoint_dir}:")
@@ -137,7 +162,6 @@ def load_checkpoint(checkpoint_dir, checkpoint_file=None):
         print(f"✗ No checkpoint found in {checkpoint_dir}")
         return None
     
-    # Sắp xếp theo episode number
     def get_episode_number(path):
         try:
             return int(path.split('_ep')[-1].split('.pth')[0])
@@ -145,14 +169,32 @@ def load_checkpoint(checkpoint_dir, checkpoint_file=None):
             return 0
     
     checkpoints.sort(key=get_episode_number, reverse=True)
-    
-    # Load checkpoint mới nhất
     latest_checkpoint = checkpoints[0]
     episode_num = get_episode_number(latest_checkpoint)
     print(f"✓ Loading latest checkpoint (episode {episode_num}): {os.path.basename(latest_checkpoint)}")
     checkpoint = torch.load(latest_checkpoint, map_location=lambda storage, loc: storage)
     
     return checkpoint
+
+def restore_logger(checkpoint_dir, log_dir, env_name):
+    """Restore logger file from checkpoint backup"""
+    logger_backup_dir = os.path.join(checkpoint_dir, 'logger_backups')
+    latest_logger = os.path.join(logger_backup_dir, 'latest_logger.log')
+    
+    if os.path.exists(latest_logger):
+        # Tạo thư mục logger nếu chưa có
+        logger_dir = os.path.join(log_dir, 'logger')
+        if not os.path.exists(logger_dir):
+            os.makedirs(logger_dir)
+        
+        # Restore logger file
+        target_logger = os.path.join(logger_dir, f'{env_name}_log')
+        shutil.copy2(latest_logger, target_logger)
+        print(f"✓ Restored logger file from checkpoint")
+        return True
+    else:
+        print(f"⚠ No logger backup found in checkpoint")
+        return False
 
 def start():
     args = parser.parse_args()
@@ -184,9 +226,11 @@ def start():
                 args.log_dir = checkpoint['log_dir']
                 print(f"  - Log directory: {args.log_dir}")
             else:
-                # Nếu không có log_dir trong checkpoint, dùng parent của checkpoint_dir
                 args.log_dir = os.path.dirname(checkpoint_dir)
                 print(f"  - Log directory (inferred): {args.log_dir}")
+            
+            # Restore logger file
+            restore_logger(checkpoint_dir, args.log_dir, args.env)
         else:
             print("\n⚠ No checkpoint found, starting fresh training")
             args.resume = False
@@ -256,7 +300,7 @@ def start():
     train_modes = manager.list()
     n_iters = manager.list()
     
-    # Shared values cho checkpoint - QUAN TRỌNG: Khởi tạo từ checkpoint
+    # Shared values cho checkpoint
     episode_counter = manager.Value('i', start_episode)
     
     print(f"\n{'='*60}")
